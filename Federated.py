@@ -4,6 +4,9 @@ import torch.nn.functional as F
 import torch.optim as optim
 from torchvision import datasets, transforms
 import logging
+import argparse
+from torch_geometric.data import GraphSAINTSampler
+from torch_geometric.nn import GraphConv
 
 # import Pysyft to help us to simulate federated leraning
 import syft as sy
@@ -20,6 +23,7 @@ hook = sy.TorchHook(torch)
 clients = []
 for device in all_machines: 
     clients.append(NodeClient(hook, device))
+    # unclear how to access each gpu
 
 # define the args
 args = {
@@ -33,43 +37,35 @@ args = {
 
 
 # create a simple CNN net
-class Net(nn.Module):
-    
-    def __init__(self):
+class Net(torch.nn.Module):
+    def __init__(self, hidden_channels):
         super(Net, self).__init__()
-        
-        self.conv = nn.Sequential(
-            nn.Conv2d(in_channels = 1, out_channels = 32, kernel_size = 3, stride = 1),
-            nn.ReLU(),
-            nn.Conv2d(in_channels=32,out_channels = 64, kernel_size = 3, stride = 1),
-            nn.ReLU()
-        )
-        
-        self.fc = nn.Sequential(
-            nn.Linear(in_features=64*12*12, out_features=128),
-            nn.ReLU(),
-            nn.Linear(in_features=128, out_features=10),
-        )
+        in_channels = dataset.num_node_features
+        out_channels = dataset.num_classes
+        self.conv1 = GraphConv(in_channels, hidden_channels)
+        self.conv2 = GraphConv(hidden_channels, hidden_channels)
+        self.conv3 = GraphConv(hidden_channels, hidden_channels)
+        self.lin = torch.nn.Linear(3 * hidden_channels, out_channels)
 
-        self.dropout = nn.Dropout2d(0.25)
-    
-    def forward(self, x):
-        x = self.conv(x)
-        x = F.max_pool2d(x,2)
-        x = x.view(-1, 64*12*12)
-        x = self.fc(x)
-        x = F.log_softmax(x, dim=1)
-        return x
+    def set_aggr(self, aggr):
+        self.conv1.aggr = aggr
+        self.conv2.aggr = aggr
+        self.conv3.aggr = aggr
+
+    def forward(self, x0, edge_index, edge_weight=None):
+        x1 = F.relu(self.conv1(x0, edge_index, edge_weight))
+        x1 = F.dropout(x1, p=0.2, training=self.training)
+        x2 = F.relu(self.conv2(x1, edge_index, edge_weight))
+        x2 = F.dropout(x2, p=0.2, training=self.training)
+        x3 = F.relu(self.conv3(x2, edge_index, edge_weight))
+        x3 = F.dropout(x3, p=0.2, training=self.training)
+        x = torch.cat([x1, x2, x3], dim=-1)
+        x = self.lin(x)
+        return x.log_softmax(dim=-1)
+
 
 dataset = Reddit('../data/Reddit')
 data = dataset[0]
-
-cluster_data = ClusterData(data, num_parts=1500, recursive=False,
-                           save_dir=dataset.processed_dir)
-train_loader = ClusterLoader(cluster_data, batch_size=20, shuffle=True,
-                             num_workers=12)
-
-
 
 # distribute dataset over clients
 federated_train_loader = sy.FederatedDataLoader(data.federate(tuple(clients),batch_size=args['batch_size'], shuffle=True)
@@ -77,8 +73,7 @@ federated_train_loader = sy.FederatedDataLoader(data.federate(tuple(clients),bat
 # test data remains with us locally
 # this is the normal torch code to load test data from MNIST
 # that we are all familiar with
-test_loader = torch.utils.data.DataLoader(data,
-        batch_size=args['test_batch_size'], shuffle=True)
+test_loader = torch.utils.data.DataLoader(data, batch_size=args['test_batch_size'], shuffle=True)
 
 def train(args, model, device, train_loader, optimizer, epoch):
     model.train()
